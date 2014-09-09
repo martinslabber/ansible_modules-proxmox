@@ -16,6 +16,13 @@ options:
   state:
     description:
      - Indicate desired state of the target.
+       Present will insure the container exists, create it if nesesary.
+       Started will insure that the container is running, if the container do not exists it will fail.
+       Active is Present then Started.
+       Stopped will insure the container is Stopped and unmounted.
+       Deleted will delete the container, if the container is running it will fail.
+       Absent is Stopped and Deleted
+       Restarted will insure that the container is stopped and then started.
     default: present
     choices: ['active', 'present', 'started', 'deleted', 'absent', 'stopped', 'restarted']
   name:
@@ -76,6 +83,22 @@ requirements: [ proxmoxer ]
 
 
 EXAMPLES = '''
+
+
+
+# Action on the container.
+# Create and Start a new container: ansible-playbook -i hosts playbook.yml --extra-vars ct_state=active
+# Stop and Delete a container: ansible-playbook -i hosts playbook.yml --extra-vars ct_state=absent
+- hosts: 127.0.0.1
+  connection: local
+  vars_prompt:
+    - name: "proxmox_password"
+      prompt: "Enter Proxmox Host Password"
+      private: yes
+  tasks:
+  - name: Run module proxmoxer_ct
+    proxmoxer_ct: state={{ ct_state }} hostname=192.168.10.116 username=root password={{ proxmox_password }} ct_id=90909 ct_ostemplate='ubuntu 14.04'
+
 '''
 
 import warnings
@@ -168,7 +191,7 @@ class ProxmoxHypervisor(object):
             return sorted(templates_available)[0]
 
 
-    def get_container_object(self, ctid):
+    def get_container_object(self, ctid=None):
         """Return container status or False if the container do not exists.
 
         Will check all the hosts in a cluster to see if any of them contain
@@ -187,6 +210,8 @@ class ProxmoxHypervisor(object):
             Object or False if the container could not be found.
 
         """
+        if ctid is None:
+            ctid = self.params.get('ct_id')
         ctid = int(ctid)
         if ctid in self._container_objs:
             return self._container_objs[ctid]
@@ -251,19 +276,28 @@ class ProxmoxHypervisor(object):
         if self.get_container_info(config['vmid']):
             self.changed = False
             self.out_dict['msg'] = 'The container already exists'
+            return
         else:
             config['ostemplate'] = self._get_template(config.get('ostemplate'))
             del(config['id'])
-            # print config
-            self.proxmox_host.openvz.create(**config)
+            task_id = self.proxmox_host.openvz.create(**config)
+            self.out_dict['task_id'] = task_id
             self.changed = True
 
-        # Debug to show we were here,
-        self.out_dict['create'] = 'yes'
+        # Blocking Wait for the create container task to stop.
+        task = self.proxmox_host.tasks(task_id)
+        count = 60
+        while count > 0:
+            count -= 1
+            task_status = task.status.get()
+            time.sleep(1)
+            if task_status.get('status') == 'stopped':
+                count = 0
 
     def ct_start(self):
         """Start a container."""
         info = self.get_container_info()
+        ctid = info.get('ctid')
         if info is False:
             self.module.fail_json(msg='Could not find container with CTID'
                                       ' of <{0}>.'.format(ctid))
@@ -276,26 +310,37 @@ class ProxmoxHypervisor(object):
                 ct.status.start.post()
             except ResourceException:
                 pass
-        # Debug to show we were here,
-        self.out_dict['start'] = 'yes'
+
+        # Blocking Wait for the container to start.
+        count = 20
+        while count > 0:
+            count -= 1
+            info = self.get_container_info()
+            if info.get('status') == 'running':
+                count = 0
+            else:
+                time.sleep(1)
 
     def ct_stop(self):
         """Stop a container."""
         info = self.get_container_info()
+        ctid = info.get('ctid')
         if info is False:
             module.fail_json(msg='Could not find container with CTID'
                                  'of "{0}".'.format(ctid))
             return
         if info.get('status') not in ['stopped', 'mounted']:
             self.changed = True
-            ct = self.get_container_object(ctid)
+            ct = self.get_container_object()
             try:
                 ct.status.stop.post()
             except ResourceException:
                 pass
 
-        info = self.get_container_info(ctid)
+        info = self.get_container_info()
         counter = 20
+        # Loop for 20x2=40 seconds waiting for container to stop, unmount if it
+        # is found in the state mounted.
         while info.get('status') != 'stopped':
             counter -= 1
             if info.get('status') == 'mounted':
@@ -303,14 +348,12 @@ class ProxmoxHypervisor(object):
                     ct.status.umount.post()
                 except ResourceException:
                     pass
-            time.sleep(2)
             if counter < 1:
                 self.module.fail_json(msg='Could not stop container with CTID'
                                           ' of <{0}>.'.format(ctid))
                 break
-
-        # Debug to show we were here,
-        self.out_dict['stop'] = 'yes'
+            time.sleep(2)
+            info = self.get_container_info()
 
     def ct_active(self):
         """Active create and start the container."""
@@ -330,7 +373,7 @@ class ProxmoxHypervisor(object):
             return
         self.ct_stop()
         self.changed = True
-        ct = self.get_container_object(ctid)
+        ct = self.get_container_object()
         try:
             ct.delete()
         except ResourceException:
