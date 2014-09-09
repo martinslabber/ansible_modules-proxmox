@@ -1,0 +1,380 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+PRESENT_CHOICES = ['active', 'present', 'started', 'deleted',
+                   'absent', 'stopped', 'restarted']
+CONTYPE_CHOICES = ['https', 'ssh_paramiko', 'openssh']
+
+DOCUMENTATION = '''
+---
+module: proxmoxer_ct
+short_description: Create, start, stop and delete Containers on a proxmox server or cluster.
+description:
+     - Manage container on a proxmox server or a cluster.
+version_added: "0.1"
+options:
+  state:
+    description:
+     - Indicate desired state of the target.
+    default: present
+    choices: ['active', 'present', 'started', 'deleted', 'absent', 'stopped', 'restarted']
+  name:
+    description:
+     - Name of the container.
+  hostname:
+     description:
+      - Hostname or IP of proxmox server to connect to.
+     required: true
+  username:
+     description:
+      - User name used to connect to proxmox.
+     required: true
+  password:
+     description:
+      - The password for username, used for connecting to proxmox.
+     required: true
+  contype:
+     description:
+      - Connection type used to connect to proxmox.
+     default: http
+     choices: ['https', 'ssh_paramiko', 'openssh']
+  ct_id:
+     description:
+      - The container id.
+  ct_ostemplate:
+     description:
+      - The template to use when creating a container.
+  ct_disk:
+     description:
+      - Size if the primary disk.
+     default: 40G
+  ct_diskinodes:
+     description:
+      - Amount of inodes to make available. If not supplied it will be derived from ct_disk
+  ct_memory:
+     description:
+      - Size of container RAM.
+     default: 1G
+  ct_swap:
+     description:
+      - Size of container swapspace. If not supplied will be derived from ct_memory
+  ct_cpus:
+     description:
+      - Amount of CPU's for the container.
+     default: 2
+  ct_password:
+     description:
+      - Password for the container.
+  ct_hostname:
+     description:
+      - Hostname of the container. If not supplied name will be used.
+
+requirements: [ proxmoxer ]
+'''
+
+# '''.format(state=str(PRESENT_CHOICES), contype_choices=CONTYPE_CHOICES)
+
+
+EXAMPLES = '''
+'''
+
+import warnings
+from proxmoxer import ProxmoxAPI, ResourceException
+
+class ProxmoxHypervisor(object):
+
+    def __init__(self, ansible_module):
+        self.module = ansible_module
+        self.params = self.module.params
+        self.changed = False
+        self.out_dict = {}
+        self.proxmox_con = None
+        self.proxmox_host = None
+        self.connect_to_proxmox()
+        self._container_objs = {}
+
+    def connect_to_proxmox(self):
+        conconf = {}
+        conconf['host'] = self.params.get('hostname')
+        conconf['password'] = self.params.get('password')
+        conconf['backend'] = self.params.get('contype')
+        conconf['user'] = '{0}@pam'.format(self.params.get('username')),
+        if conconf['backend'] == 'https':
+            conconf['verify_ssl'] = False
+        if self.params.get('port'):
+            conconf['port'] = self.params.get('port')
+        # Monkey Patch warnings.warn, catching warnings do not work.
+        orig_warn = warnings.warn
+        warnings.warn = lambda a, b: None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.proxmox_con = ProxmoxAPI(**conconf)
+        warnings.ward = orig_warn
+        # Extract the node names as identified in proxmox.
+        nodes = [n['node'] for n in self.proxmox_con.nodes.get()]
+        if not nodes:
+            # Cannot see how we will end here.
+            module.fail_json(msg='The API exposes no hosts to connect with.')
+        elif len(nodes) == 1:
+            # Not a cluster.
+            self.proxmox_host = self.proxmox_con.nodes(nodes[0])
+        else:
+            # In a Cluster get a proxmox-node to work on.
+            if self.params.get('clusternode') in nodes:
+                self.proxmox_host = self.proxmox_con.nodes(
+                    self.params.get('clusternode'))
+            else:
+                self.proxmox_host = self.proxmox_con.nodes(nodes[0])
+
+    def container_to_state(self, state=None):
+        if self.proxmox_con is None or self.proxmox_host is None:
+            module.fail_json(msg='No Proxmox connection could be created.')
+        if state is None:
+            state = self.params.get('state')
+        {'started': self.ct_start,
+         'active': self.ct_active,
+         'present': self.ct_create,
+         'stopped': self.ct_stop,
+         'restarted': self.ct_restart,
+         'absent': self.ct_delete,
+         'deleted': self.ct_delete,
+         'created': self.ct_create}.get(state)()
+        self.module.exit_json(changed=self.changed, **self.out_dict)
+
+    def _get_template(self, template):
+        """Get the template that best matches.
+
+        Parameters
+        ----------
+
+        template: String
+            The template name or words that must be present in the template name.
+        """
+        templates = self.get_templates()
+        templates_available = []
+        words = [w.lower() for w in template.split()]
+        for item in templates:
+            for word in words:
+                if word not in item:
+                    # All words must be present in the template.
+                    break
+            else:
+                templates_available.append(item)
+
+        if not templates_available:
+            return
+        else:
+            # Could probably be a bit more clever here.
+            return sorted(templates_available)[0]
+
+
+    def get_container_object(self, ctid):
+        """Return container status or False if the container do not exists.
+
+        Will check all the hosts in a cluster to see if any of them contain
+        the container.  This methods caches the container object so it is
+        safe to call this when the objects is needed.
+
+        Parameters
+        ----------
+
+        ctid: Integer
+            The id of the container
+
+        Returns
+        -------
+
+            Object or False if the container could not be found.
+
+        """
+        ctid = int(ctid)
+        if ctid in self._container_objs:
+            return self._container_objs[ctid]
+        nodes = [n['node'] for n in self.proxmox_con.nodes.get()]
+        for host_name in nodes:
+            host =  self.proxmox_con.nodes(host_name)
+            try:
+                ct = host.openvz.get(ctid)  # Check if ct exists.
+                ct = host.openvz(ctid)
+                self._container_objs[ctid] = ct
+                return ct
+            except ResourceException:
+                # Resource not found, try the next host.
+                continue
+        return False
+
+    def get_container_info(self, ctid=None):
+        """Get information and status of a container."""
+        if ctid is None:
+            ctid = self.params.get('ct_id')
+        ct = self.get_container_object(ctid)
+        if ct is False:
+            return False
+        data = {'ctid': ctid}
+        data['config'] = ct.config.get()
+        data.update(ct.status.current.get())
+        # data['host'] = host_name
+        return data
+
+    def get_templates(self):
+        """Get a list of all the available templates."""
+        templates = []
+        for store_name in [s['storage'] for s in self.proxmox_host.storage.get()]:
+            if not store_name:
+                continue
+            sobj = getattr(self.proxmox_host.storage, (store_name))
+            sobj = getattr(sobj, 'content')
+            for item in sobj.get():
+                if item.get('content') == 'vztmpl':
+                    templates.append(item.get('volid'))
+        return [t for t in templates if t]
+
+    def ct_create(self):
+        """Create a contaner."""
+        replace = {'swap': 'memory'}
+        config = {'storage': 'local', 'memory': 512, 'swap': 512, 'cpus': 1,
+                  'disk': 4, 'password': 'secret'}
+        conf_keys = ['id', 'ostemplate', 'hostname', 'ip_address']
+        conf_keys.extend(config.keys())
+
+        for key in conf_keys:
+            value = self.params.get('ct_' + key)
+            if value is not None:
+                config[key] = value
+
+        for key1, key2 in replace.items():
+            value = config.get(key1)
+            if not value or value <= 0:
+                config[key1] = config.get(key2)
+
+        config['vmid'] = config['id']
+        if self.get_container_info(config['vmid']):
+            self.changed = False
+            self.out_dict['msg'] = 'The container already exists'
+        else:
+            config['ostemplate'] = self._get_template(config.get('ostemplate'))
+            del(config['id'])
+            # print config
+            self.proxmox_host.openvz.create(**config)
+            self.changed = True
+
+        # Debug to show we were here,
+        self.out_dict['create'] = 'yes'
+
+    def ct_start(self):
+        """Start a container."""
+        info = self.get_container_info()
+        if info is False:
+            self.module.fail_json(msg='Could not find container with CTID'
+                                      ' of <{0}>.'.format(ctid))
+            return
+
+        if info.get('status') != 'running':
+            self.changed = True
+            ct = self.get_container_object(ctid)
+            try:
+                ct.status.start.post()
+            except ResourceException:
+                pass
+        # Debug to show we were here,
+        self.out_dict['start'] = 'yes'
+
+    def ct_stop(self):
+        """Stop a container."""
+        info = self.get_container_info()
+        if info is False:
+            module.fail_json(msg='Could not find container with CTID'
+                                 'of "{0}".'.format(ctid))
+            return
+        if info.get('status') not in ['stopped', 'mounted']:
+            self.changed = True
+            ct = self.get_container_object(ctid)
+            try:
+                ct.status.stop.post()
+            except ResourceException:
+                pass
+
+        info = self.get_container_info(ctid)
+        counter = 20
+        while info.get('status') != 'stopped':
+            counter -= 1
+            if info.get('status') == 'mounted':
+                try:
+                    ct.status.umount.post()
+                except ResourceException:
+                    pass
+            time.sleep(2)
+            if counter < 1:
+                self.module.fail_json(msg='Could not stop container with CTID'
+                                          ' of <{0}>.'.format(ctid))
+                break
+
+        # Debug to show we were here,
+        self.out_dict['stop'] = 'yes'
+
+    def ct_active(self):
+        """Active create and start the container."""
+        self.ct_create()
+        self.ct_start()
+
+    def ct_restart(self):
+        """Send a stop and start to the container."""
+        self.ct_stop()
+        self.ct_start()
+
+    def ct_delete(self):
+        """Stop and delete the container."""
+        info = self.get_container_info()
+        if info is False:
+            self.changed = False
+            return
+        self.ct_stop()
+        self.changed = True
+        ct = self.get_container_object(ctid)
+        try:
+            ct.delete()
+        except ResourceException:
+            pass
+
+        # Debug to show we were here.
+        self.out_dict['delete'] = 'yes'
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            state=dict(default='present', choices=PRESENT_CHOICES),
+            name=dict(type='str'),
+            hostname=dict(type='str'),
+            port=dict(type='int'),
+            username=dict(default='root', type='str'),
+            password=dict(type='str', no_log=True),
+            contype=dict(default='https', choices=CONTYPE_CHOICES),
+            ct_id=dict(type='int', default=-1),
+            ct_ostemplate=dict(default='ubuntu', type='str'),
+            ct_disk=dict(type='int', default=40 * 1024 ** 2),
+            ct_diskinodes=dict(type='int'),
+            ct_memory=dict(type='int', default=1024),
+            ct_swap=dict(type='int'),
+            ct_cpus=dict(type='int', default=2),
+            ct_password=dict(type='str', default='P455w0rd', no_log=False),
+            ct_hostname=dict(type='str'),
+        ),
+        required_together = (
+            ['hostname', 'username', 'password']
+        )
+    )
+
+    with open('/tmp/ansible_module_params', 'w') as fh:
+        fh.write(str(module.params))
+
+    try:
+        proxmox = ProxmoxHypervisor(module)
+        proxmox.container_to_state()
+    except Exception as e:
+        module.fail_json(msg=str(e))
+
+
+# import module snippets
+from ansible.module_utils.basic import *
+main()
