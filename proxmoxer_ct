@@ -162,6 +162,11 @@ class ProxmoxHypervisor(object):
          'absent': self.ct_delete,
          'deleted': self.ct_delete,
          'created': self.ct_create}.get(state)()
+        info = self.get_container_info()
+        if isinstance(info, dict):
+            self.out_dict.update(info)
+        else:
+            self.out_dict['status'] = 'absent'
         self.module.exit_json(changed=self.changed, **self.out_dict)
 
     def _get_template(self, template):
@@ -402,6 +407,7 @@ def main():
             ct_cpus=dict(type='int', default=2),
             ct_password=dict(type='str', default='P455w0rd', no_log=False),
             ct_hostname=dict(type='str'),
+            ct_ip_address=dict(type='str'),
         ),
         required_together = (
             ['hostname', 'username', 'password']
