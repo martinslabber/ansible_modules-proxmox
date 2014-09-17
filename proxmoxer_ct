@@ -53,18 +53,16 @@ options:
       - The template to use when creating a container.
   ct_disk:
      description:
-      - Size if the primary disk.
-     default: 40G
-  ct_diskinodes:
-     description:
-      - Amount of inodes to make available. If not supplied it will be derived from ct_disk
+      - Size of the primary disk in GB.
+     default: 40
   ct_memory:
      description:
-      - Size of container RAM.
-     default: 1G
+      - Size of container RAM in MB.
+     default: 1024
   ct_swap:
      description:
       - Size of container swapspace. If not supplied will be derived from ct_memory
+      default: equals to memory
   ct_cpus:
      description:
       - Amount of CPU's for the container.
@@ -75,6 +73,13 @@ options:
   ct_hostname:
      description:
       - Hostname of the container. If not supplied name will be used.
+  ct_onboot:
+     description:
+      - Should the container boot up if proxmox starts up.
+     default: yes
+  ct_netif:
+     description:
+      - Network interface description string.
 
 requirements: [ proxmoxer ]
 '''
@@ -83,9 +88,6 @@ requirements: [ proxmoxer ]
 
 
 EXAMPLES = '''
-
-
-
 # Action on the container.
 # Create and Start a new container: ansible-playbook -i hosts playbook.yml --extra-vars ct_state=active
 # Stop and Delete a container: ansible-playbook -i hosts playbook.yml --extra-vars ct_state=absent
@@ -98,7 +100,6 @@ EXAMPLES = '''
   tasks:
   - name: Run module proxmoxer_ct
     proxmoxer_ct: state={{ ct_state }} hostname=192.168.10.116 username=root password={{ proxmox_password }} ct_id=90909 ct_ostemplate='ubuntu 14.04'
-
 '''
 
 import warnings
@@ -184,7 +185,7 @@ class ProxmoxHypervisor(object):
         for item in templates:
             for word in words:
                 if word not in item:
-                    # All words must be present in the template.
+                    # All words must be present in the template name.
                     break
             else:
                 templates_available.append(item)
@@ -259,18 +260,20 @@ class ProxmoxHypervisor(object):
                     templates.append(item.get('volid'))
         return [t for t in templates if t]
 
-    def ct_create(self):
-        """Create a contaner."""
+    def _clean_config(self):
+        """Manipulate the config values recieved from ansible into the
+        form proxmoxer needs it.
+        """
         replace = {'swap': 'memory'}
-        config = {'storage': 'local', 'memory': 512, 'swap': 512, 'cpus': 1,
-                  'disk': 4, 'password': 'secret'}
-        conf_keys = ['id', 'ostemplate', 'hostname', 'ip_address']
-        conf_keys.extend(config.keys())
+        config = {'storage': 'local', 'memory': 1024, 'cpus': 1,
+                  'disk': 40, 'password': 'P455w0rd'}
 
-        for key in conf_keys:
-            value = self.params.get('ct_' + key)
+        # We prefixed all the api keywords with ct_
+        for key in [k for k in self.params.keys() if k.startswith('ct_')]:
+            value = self.params.get(key)
             if value is not None:
-                config[key] = value
+                pmx_key = key.replace('ct_', '')
+                config[pmx_key] = value
 
         for key1, key2 in replace.items():
             value = config.get(key1)
@@ -278,14 +281,27 @@ class ProxmoxHypervisor(object):
                 config[key1] = config.get(key2)
 
         config['vmid'] = config['id']
+        config['onboot'] = 1 if self.module.boolean(config.get('onboot', True)) else 0
+        del(config['id'])
+        if not config.get('hostname'):
+            config['hostname'] = 'Container{0}'.format(config['vmid'])
+        return config
+
+    def ct_create(self):
+        """Create a contaner."""
+        config = self._clean_config()
         if self.get_container_info(config['vmid']):
             self.changed = False
             self.out_dict['msg'] = 'The container already exists'
             return
         else:
             config['ostemplate'] = self._get_template(config.get('ostemplate'))
-            del(config['id'])
-            task_id = self.proxmox_host.openvz.create(**config)
+            try:
+                task_id = self.proxmox_host.openvz.create(**config)
+            except Exception as e:
+                self.module.fail_json(msg='Could not create container: %s' % str(e),
+                                      config=config)
+
             self.out_dict['task_id'] = task_id
             self.changed = True
 
@@ -400,7 +416,7 @@ def main():
             contype=dict(default='https', choices=CONTYPE_CHOICES),
             ct_id=dict(type='int', default=-1),
             ct_ostemplate=dict(default='ubuntu', type='str'),
-            ct_disk=dict(type='int', default=40 * 1024 ** 2),
+            ct_disk=dict(type='int', default=40),
             ct_diskinodes=dict(type='int'),
             ct_memory=dict(type='int', default=1024),
             ct_swap=dict(type='int'),
@@ -408,6 +424,8 @@ def main():
             ct_password=dict(type='str', default='P455w0rd', no_log=False),
             ct_hostname=dict(type='str'),
             ct_ip_address=dict(type='str'),
+            ct_onboot=dict(choices=BOOLEANS, default='true'),
+            ct_netif=dict(type='str'),
         ),
         required_together = (
             ['hostname', 'username', 'password']
