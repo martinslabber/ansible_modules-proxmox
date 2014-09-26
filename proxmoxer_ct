@@ -194,7 +194,7 @@ class ProxmoxHypervisor(object):
             return
         else:
             # Could probably be a bit more clever here.
-            return sorted(templates_available)[0]
+            return sorted(templates_available)[-1]
 
 
     def get_container_object(self, ctid=None):
